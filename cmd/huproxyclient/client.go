@@ -130,16 +130,22 @@ func main() {
 		dialer.TLSClientConfig.Certificates = []tls.Certificate{cert}
 	}
 
-	conn, resp, err := dialer.Dial(url, head)
+	wsConn, resp, err := dialer.Dial(url, head)
 	if err != nil {
 		dialError(url, resp, err)
 	}
-	defer conn.Close()
+	defer wsConn.Close()
 
-	// websocket -> stdout
+	// dial tcp ssh port
+	sshConn, err := dialContext(ctx, "tcp", "localhost:22")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// websocket -> ssh port
 	go func() {
 		for {
-			mt, r, err := conn.NextReader()
+			mt, r, err := wsConn.NextReader()
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 				return
 			}
@@ -149,17 +155,17 @@ func main() {
 			if mt != websocket.BinaryMessage {
 				log.Fatal("non-binary websocket message received")
 			}
-			if _, err := io.Copy(os.Stdout, r); err != nil {
+			if _, err := io.Copy(sshConn, r); err != nil {
 				log.Errorf("Reading from websocket: %v", err)
 				cancel()
 			}
 		}
 	}()
 
-	// stdin -> websocket
+	// ssh port -> websocket
 	// TODO: NextWriter() seems to be broken.
-	if err := huproxy.File2WS(ctx, cancel, os.Stdin, conn); err == io.EOF {
-		if err := conn.WriteControl(websocket.CloseMessage,
+	if err := huproxy.File2WS(ctx, cancel, sshConn, wsConn); err == io.EOF {
+		if err := wsConn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
 			time.Now().Add(*writeTimeout)); err == websocket.ErrCloseSent {
 		} else if err != nil {
