@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -42,62 +42,86 @@ var (
 func handleProxy(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-
-	vars := mux.Vars(r)
-	host := vars["host"]
-	port := vars["port"]
-
-	conn, err := upgrader.Upgrade(w, r, nil)
+	// Upgrade the HTTP connection to a websocket connection.
+	wsConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Warningf("Failed to upgrade to websockets: %v", err)
 		return
 	}
-	defer conn.Close()
+	defer wsConn.Close()
 
-	s, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), *dialTimeout)
+	// receives the request from rpi websocket client, start a TCP server so other clients on the same network can connect to it
+	// and then forwards the request to the TCP server and forwards the response back to the rpi websocket client
+	tcpListener, err := net.Listen("tcp", "9001")
 	if err != nil {
-		log.Warningf("Failed to connect to %q:%q: %v", host, port, err)
 		return
 	}
-	defer s.Close()
 
-	// websocket -> server
+	// start a goroutine to handle the TCP server
 	go func() {
 		for {
-			mt, r, err := conn.NextReader()
-			if websocket.IsCloseError(err,
-				websocket.CloseNormalClosure,   // Normal.
-				websocket.CloseAbnormalClosure, // OpenSSH killed proxy client.
-			) {
-				return
-			}
+			tcpConn, err := tcpListener.Accept()
 			if err != nil {
-				log.Errorf("nextreader: %v", err)
 				return
 			}
-			if mt != websocket.BinaryMessage {
-				log.Errorf("received non-binary websocket message")
-				return
-			}
-			if _, err := io.Copy(s, r); err != nil {
-				log.Warningf("Reading from websocket: %v", err)
-				cancel()
-			}
+			go func() {
+				defer tcpConn.Close()
+				// handle the TCP connection
+				// read the request from the TCP connection
+				// copy websocket conn bytes to tcp conn
+				go func() {
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+							for {
+								mt, r, err := wsConn.NextReader()
+								if websocket.IsCloseError(err,
+									websocket.CloseNormalClosure,   // Normal.
+									websocket.CloseAbnormalClosure, // OpenSSH killed proxy client.
+								) {
+									return
+								}
+								if err != nil {
+									log.Errorf("nextreader: %v", err)
+									return
+								}
+								if mt != websocket.BinaryMessage {
+									log.Errorf("received non-binary websocket message")
+									return
+								}
+								if _, err := io.Copy(tcpConn, r); err != nil {
+									log.Warningf("Reading from websocket: %v", err)
+									cancel()
+								}
+							}
+						}
+					}
+				}()
+				// copy tcp conn bytes to websocket conn
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						buf := make([]byte, 1024)
+						n, err := tcpConn.Read(buf)
+						if err != nil {
+							log.Warningf("Reading from file: %v", err)
+							cancel()
+							return
+						}
+						if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+							log.Warningf("Writing to websocket: %v", err)
+							cancel()
+							return
+						}
+					}
+				}
+			}()
 		}
 	}()
-
-	// server -> websocket
-	// TODO: NextWriter() seems to be broken.
-	if err := huproxy.File2WS(ctx, cancel, s, conn); err == io.EOF {
-		if err := conn.WriteControl(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-			time.Now().Add(*writeTimeout)); err == websocket.ErrCloseSent {
-		} else if err != nil {
-			log.Warningf("Error sending close message: %v", err)
-		}
-	} else if err != nil {
-		log.Warningf("Reading from file: %v", err)
-	}
 }
 
 func main() {
